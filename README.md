@@ -218,6 +218,8 @@ $ docker-compose down
 
 - Open [http://localhost:3000](http://localhost:3000) in your browser.
 
+For the hardened Kubernetes image, short-lived Coturn credentials, and release workflow contract, see [Kubernetes production runtime](docs/kubernetes-production.md).
+
 </details>
 
 <details open>

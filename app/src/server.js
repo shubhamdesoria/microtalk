@@ -54,6 +54,7 @@ dependencies: {
 const { auth, requiresAuth } = require('express-openid-connect');
 const { Server } = require('socket.io');
 const httpolyglot = require('httpolyglot');
+const http = require('http');
 const compression = require('compression');
 const express = require('express');
 const cors = require('cors');
@@ -70,6 +71,9 @@ const Validate = require('./validate');
 const HtmlInjector = require('./htmlInjector');
 const Host = require('./host');
 const Logs = require('./logs');
+const { createIceServers, validateIceServerConfiguration } = require('./iceServers');
+const { verifyAppointmentJoinToken } = require('./appointmentJoinToken');
+const { isAppointmentPresenter, isAppointmentRoomMember, isAppointmentRoomPeer } = require('./appointmentRoomAccess');
 const log = new Logs('server');
 
 // Central configuration (reads .env via dotenv internally)
@@ -98,18 +102,15 @@ const host = config.server.host;
 
 const authHost = new Host(); // Authenticated IP by Login
 
-// Define paths to the SSL key and certificate files
-const keyPath = path.join(__dirname, '../ssl/key.pem');
-const certPath = path.join(__dirname, '../ssl/cert.pem');
-
-// Read SSL key and certificate files securely
-const options = {
-    key: fs.readFileSync(keyPath, 'utf-8'),
-    cert: fs.readFileSync(certPath, 'utf-8'),
-};
-
-// Server both http and https
-const server = httpolyglot.createServer(options, app);
+const server = config.server.https
+    ? httpolyglot.createServer(
+          {
+              key: fs.readFileSync(config.server.tlsKeyPath || path.join(__dirname, '../ssl/key.pem'), 'utf-8'),
+              cert: fs.readFileSync(config.server.tlsCertPath || path.join(__dirname, '../ssl/cert.pem'), 'utf-8'),
+          },
+          app
+      )
+    : http.createServer(app);
 
 // Handle client errors (malformed/incomplete HTTP requests) gracefully
 server.on('clientError', (err, socket) => {
@@ -156,6 +157,12 @@ const jwtCfg = {
     JWT_KEY: config.jwt.key,
     JWT_EXP: config.jwt.exp,
 };
+const appointmentJoinCfg = {
+    required: config.appointmentJoin?.required || false,
+    issuer: config.appointmentJoin?.issuer || 'nitya-aarogya-backend',
+    audience: config.appointmentJoin?.audience || 'nitya-aarogya-mirotalk',
+    secret: jwtCfg.JWT_KEY,
+};
 
 // Room presenters
 const roomPresenters = config.presenters;
@@ -185,18 +192,12 @@ const webhook = {
 
 // Stun (https://bloggeek.me/webrtcglossary/stun/)
 // Turn (https://bloggeek.me/webrtcglossary/turn/)
-const iceServers = [];
-const stunServerUrl = config.webrtc.stun.url;
-const turnServerUrl = config.webrtc.turn.url;
-const turnServerUsername = config.webrtc.turn.username;
-const turnServerCredential = config.webrtc.turn.credential;
 const stunServerEnabled = config.webrtc.stun.enabled;
 const turnServerEnabled = config.webrtc.turn.enabled;
-// Stun is mandatory for not internal network
-if (stunServerEnabled && stunServerUrl) iceServers.push({ urls: stunServerUrl });
-// Turn is recommended if direct peer to peer connection is not possible
-if (turnServerEnabled && turnServerUrl && turnServerUsername && turnServerCredential) {
-    iceServers.push({ urls: turnServerUrl, username: turnServerUsername, credential: turnServerCredential });
+validateIceServerConfiguration(config.webrtc, config.server.environment === 'production');
+
+function getIceServers(identity) {
+    return createIceServers(config.webrtc, { identity });
 }
 
 // Test Stun and Turn connection with query params
@@ -378,6 +379,7 @@ const channels = {}; // collect channels
 const sockets = {}; // collect sockets
 const peers = {}; // collect peers info grp by channels
 const presenters = {}; // collect presenters grp by channels
+const roomAppointments = {}; // bind protected rooms to one appointment while active
 
 const roomMetaKeys = new Set(['lock', 'password']);
 
@@ -411,6 +413,10 @@ app.use(express.json()); // Parse JSON bodies
 app.use(express.urlencoded({ extended: false })); // Parse URL-encoded bodies
 app.use(apiBasePath + '/docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument)); // api docs
 
+app.get('/healthz', (req, res) => {
+    res.status(200).json({ status: 'ok' });
+});
+
 // Restrict access to specified IP
 app.use((req, res, next) => {
     if (!ipWhitelist.enabled) return next();
@@ -425,13 +431,9 @@ app.use((req, res, next) => {
 });
 
 app.use((req, res, next) => {
-    const ipAddress = getIP(req);
     log.debug('New request:', {
-        ip: ipAddress,
         method: req.method,
-        path: req.originalUrl,
-        body: req.body,
-        //headers: req.headers,
+        path: req.path,
     });
     next();
 });
@@ -443,8 +445,6 @@ const mattermost = new MattermostController(app, mattermostCfg, htmlInjector, vi
 app.use((err, req, res, next) => {
     if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
         log.error('Request Error', {
-            header: req.headers,
-            body: req.body,
             error: err.message,
         });
         return res.status(400).send({ status: 400, message: 'Invalid JSON' }); // Bad request
@@ -570,7 +570,7 @@ app.get(['/privacy'], (req, res) => {
 // test Stun and Turn connections
 app.get(['/icetest'], (req, res) => {
     if (Object.keys(req.query).length > 0) {
-        log.debug('Request Query', req.query);
+        log.debug('Direct join request received');
     }
     res.sendFile(views.stunTurn);
 });
@@ -599,8 +599,18 @@ app.post('/isWidgetRoomActive', (req, res) => {
 
 // Handle Direct join room with params
 app.get('/join/', async (req, res) => {
+    if (appointmentJoinCfg.required) {
+        if (Object.keys(req.query).length > 0) {
+            return res.status(400).json({ message: 'Use the signed appointment link supplied by the clinic' });
+        }
+        return htmlInjector.injectHtml(views.client, res);
+    }
+
     if (Object.keys(req.query).length > 0) {
-        log.debug('Request Query', req.query);
+        log.debug('Request Query', {
+            ...req.query,
+            token: req.query.token ? '[REDACTED]' : undefined,
+        });
         /* 
             http://localhost:3000/join?room=test&name=mirotalk&audio=1&video=1&screen=0&chat=1&notify=0&hide=0
             https://p2p.mirotalk.com/join?room=test&name=mirotalk&audio=1&video=1&screen=0&chat=1&notify=0&hide=0&duration=00:00:30
@@ -617,6 +627,20 @@ app.get('/join/', async (req, res) => {
             return res.status(400).json({
                 message: 'Invalid Room name!\nPath traversal pattern detected!',
             });
+        }
+
+        if (appointmentJoinCfg.required) {
+            try {
+                verifyAppointmentJoinToken(token, {
+                    ...appointmentJoinCfg,
+                    room,
+                    displayName: name,
+                });
+                return htmlInjector.injectHtml(views.client, res);
+            } catch (err) {
+                log.warn('Appointment join rejected', { reason: err.message });
+                return res.status(401).json({ message: 'Invalid or expired appointment link' });
+            }
         }
 
         const allowRoomAccess = isAllowedRoomAccess('/join/params', req, hostCfg, peers, room);
@@ -694,6 +718,10 @@ app.get('/join/:roomId', function (req, res) {
     if (!Validate.isValidRoomName(roomId)) {
         log.warn('/join/:roomId invalid', roomId);
         return res.redirect('/');
+    }
+
+    if (appointmentJoinCfg.required) {
+        return res.status(401).json({ message: 'A signed appointment link is required' });
     }
 
     const allowRoomAccess = isAllowedRoomAccess('/join/:roomId', req, hostCfg, peers, roomId);
@@ -845,7 +873,7 @@ app.get(`${apiBasePath}/stats`, (req, res) => {
 // request token endpoint
 app.post(`${apiBasePath}/token`, (req, res) => {
     // Check if endpoint allowed
-    if (api_disabled.includes('token')) {
+    if (appointmentJoinCfg.required || api_disabled.includes('token')) {
         return res.status(403).json({
             error: 'This endpoint has been disabled. Please contact the administrator for further information.',
         });
@@ -903,7 +931,7 @@ app.get(`${apiBasePath}/meetings`, (req, res) => {
 // API request meeting room endpoint
 app.post(`${apiBasePath}/meeting`, (req, res) => {
     // Check if endpoint allowed
-    if (api_disabled.includes('meeting')) {
+    if (appointmentJoinCfg.required || api_disabled.includes('meeting')) {
         return res.status(403).json({
             error: 'This endpoint has been disabled. Please contact the administrator for further information.',
         });
@@ -929,7 +957,7 @@ app.post(`${apiBasePath}/meeting`, (req, res) => {
 // API request join room endpoint
 app.post(`${apiBasePath}/join`, (req, res) => {
     // Check if endpoint allowed
-    if (api_disabled.includes('join')) {
+    if (appointmentJoinCfg.required || api_disabled.includes('join')) {
         return res.status(403).json({
             error: 'This endpoint has been disabled. Please contact the administrator for further information.',
         });
@@ -1052,62 +1080,36 @@ app.use((err, req, res, next) => {
 });
 
 /**
- * Get Server config
+ * Get a log-safe server configuration summary.
  * @param {string} tunnel
  * @returns server config
  */
 function getServerConfig(tunnel = false) {
     return {
-        // General Server Information
         server: host,
         server_tunnel: tunnel,
         trust_proxy: trustProxy,
         api_docs: api_docs,
-
-        // Core Configurations
-        jwtCfg: jwtCfg,
         cors: corsOptions,
-        iceServers: iceServers,
+        ice_server_urls: getIceServers().flatMap((iceServer) => iceServer.urls),
         test_ice_servers: testStunTurn,
-        email: nodemailer.emailCfg.alert ? nodemailer.emailCfg : false,
-
-        // Security, Authorization, and User Management
-        oidc: OIDC.enabled ? OIDC : false,
-        host_protected: hostCfg.protected || hostCfg.user_auth ? hostCfg : false,
-        presenters: roomPresenters,
-        ip_whitelist: ipWhitelist.enabled ? ipWhitelist : false,
-        api_key_secret: api_key_secret,
-
-        // Media and Connection Settings
+        oidc_enabled: OIDC.enabled,
+        host_protected: hostCfg.protected,
+        host_user_auth: hostCfg.user_auth,
+        appointment_join_tokens_required: appointmentJoinCfg.required,
+        ip_whitelist_enabled: ipWhitelist.enabled,
         turn_enabled: turnServerEnabled,
         ip_lookup_enabled: IPLookupEnabled,
-
-        // Integrations
-        chatGPT_enabled: configChatGPT.enabled ? configChatGPT : false,
+        stun_enabled: stunServerEnabled,
+        chatGPT_enabled: configChatGPT.enabled,
         slack_enabled: slackEnabled,
-        mattermost_enabled: mattermostCfg.enabled ? mattermostCfg : false,
-        webhook: webhook.enabled ? webhook : false,
-
-        // Monitoring and Logging
+        mattermost_enabled: mattermostCfg.enabled,
+        webhook_enabled: webhook.enabled,
         sentry_enabled: sentryEnabled,
-        stats: statsData.enabled ? statsData : false,
-
-        // Ngrok Configuration
-        ngrok: ngrokEnabled
-            ? {
-                  enabled: ngrokEnabled,
-                  token: ngrokAuthToken,
-              }
-            : false,
-
-        // URLs for Redirection and Survey
-        survey: surveyEnabled ? surveyURL : false,
-        redirect: redirectEnabled ? redirectURL : false,
-
-        // Widget Configuration
-        widget: config.brand?.widget?.enabled ? config.brand.widget : false,
-
-        // Versions and environment information
+        stats_enabled: statsData.enabled,
+        ngrok_enabled: ngrokEnabled,
+        survey_enabled: surveyEnabled,
+        redirect_enabled: redirectEnabled,
         environment: config.server.environment,
         app_version: packageJson.version,
         node_version: process.versions.node,
@@ -1177,6 +1179,15 @@ io.sockets.on('connect', async (socket) => {
     socket.channels = {};
     sockets[socket.id] = socket;
 
+    const hasRoomAccess = (roomId, claimedName) =>
+        !appointmentJoinCfg.required || isAppointmentRoomMember(socket, roomId, peers, claimedName);
+    const hasPeerAccess = (peerId, roomId = socket.appointmentJoin?.room) =>
+        !appointmentJoinCfg.required || isAppointmentRoomPeer(socket, sockets[peerId], roomId, peers);
+    const hasPresenterAccess = (roomId, peerId, peerName, peerUuid) =>
+        appointmentJoinCfg.required
+            ? isAppointmentPresenter(socket, roomId, peers)
+            : isPeerPresenter(roomId, peerId, peerName, peerUuid);
+
     const transport = socket.conn.transport.name; // in most cases, "polling"
     log.debug('[' + socket.id + '] Connection transport', transport);
 
@@ -1212,6 +1223,8 @@ io.sockets.on('connect', async (socket) => {
 
         //...
         const { room_id, peer_id, peer_name, method, params } = data;
+
+        if (!hasRoomAccess(room_id, peer_name)) return cb(false);
 
         switch (method) {
             case 'checkPeerName':
@@ -1306,8 +1319,10 @@ io.sockets.on('connect', async (socket) => {
 
         if (!Validate.isValidData(config)) return;
 
-        // log.debug('Join room', config);
-        log.debug('[' + socket.id + '] join ', config);
+        log.debug('[' + socket.id + '] join ', {
+            ...config,
+            peer_token: config.peer_token ? '[REDACTED]' : false,
+        });
 
         const {
             channel,
@@ -1335,6 +1350,29 @@ io.sockets.on('connect', async (socket) => {
         if (channel in socket.channels) {
             return log.debug('[' + socket.id + '] [Warning] already joined', channel);
         }
+
+        let is_presenter = true;
+        let appointmentJoinClaims = null;
+
+        if (appointmentJoinCfg.required) {
+            try {
+                const claims = verifyAppointmentJoinToken(peer_token, {
+                    ...appointmentJoinCfg,
+                    room: channel,
+                    displayName: peer_name,
+                });
+                if (roomAppointments[channel] && roomAppointments[channel] !== claims.appointmentRef) {
+                    throw new Error('Room is bound to another appointment');
+                }
+                is_presenter = claims.presenter;
+                appointmentJoinClaims = claims;
+                socket.appointmentJoin = claims;
+            } catch (err) {
+                log.warn('[' + socket.id + '] appointment join rejected', { reason: err.message });
+                return socket.emit('unauthorized');
+            }
+        }
+
         // no channel aka room in channels init
         if (!(channel in channels)) channels[channel] = {};
 
@@ -1344,10 +1382,8 @@ io.sockets.on('connect', async (socket) => {
         // no presenter aka host in presenters init
         if (!(channel in presenters)) presenters[channel] = {};
 
-        let is_presenter = true;
-
         // User Auth required, we check if peer valid
-        if (hostCfg.user_auth || peer_token) {
+        if (!appointmentJoinCfg.required && (hostCfg.user_auth || peer_token)) {
             // Check JWT
             if (peer_token) {
                 try {
@@ -1374,7 +1410,6 @@ io.sockets.on('connect', async (socket) => {
                     log.debug('[' + socket.id + '] JOIN ROOM - USER AUTH check peer', {
                         ip: peer_ip,
                         peer_username: username,
-                        peer_password: password,
                         peer_valid: isPeerValid,
                         peer_presenter: is_presenter,
                     });
@@ -1395,6 +1430,8 @@ io.sockets.on('connect', async (socket) => {
             return socket.emit('roomIsLocked');
         }
 
+        if (appointmentJoinClaims) roomAppointments[channel] = appointmentJoinClaims.appointmentRef;
+
         // Set the presenters
         const presenter = {
             peer_ip: peer_ip,
@@ -1402,10 +1439,11 @@ io.sockets.on('connect', async (socket) => {
             peer_uuid: peer_uuid,
             is_presenter: is_presenter,
         };
-        // first we check if the username match the presenters username
-        if (roomPresenters && roomPresenters.includes(peer_name)) {
+        if (appointmentJoinCfg.required && is_presenter) {
             presenters[channel][socket.id] = presenter;
-        } else {
+        } else if (!appointmentJoinCfg.required && roomPresenters && roomPresenters.includes(peer_name)) {
+            presenters[channel][socket.id] = presenter;
+        } else if (!appointmentJoinCfg.required) {
             // if not match the presenters username, the first one join room is the presenter
             if (Object.keys(presenters[channel]).length === 0) {
                 presenters[channel][socket.id] = presenter;
@@ -1483,9 +1521,13 @@ io.sockets.on('connect', async (socket) => {
         // Handle WebHook
         if (webhook.enabled) {
             // Trigger a POST request when a user joins
-            config.timestamp = log.getDateTime(false);
+            const webhookData = {
+                ...config,
+                peer_token: undefined,
+                timestamp: log.getDateTime(false),
+            };
             axios
-                .post(webhook.url, { event: 'join', data: config }, { timeout: 5000 }) // 5 second timeout
+                .post(webhook.url, { event: 'join', data: webhookData }, { timeout: 5000 }) // 5 second timeout
                 .then((response) => log.debug('Join event tracked:', response.data))
                 .catch((error) => log.error('Error tracking join event:', error.message));
         }
@@ -1497,6 +1539,8 @@ io.sockets.on('connect', async (socket) => {
     socket.on('relayICE', async (config) => {
         if (!Validate.isValidData(config)) return;
         const { peer_id, ice_candidate } = config;
+
+        if (!hasPeerAccess(peer_id)) return;
 
         // log.debug('[' + socket.id + '] relay ICE-candidate to [' + peer_id + '] ', {
         //     address: config.ice_candidate,
@@ -1514,6 +1558,8 @@ io.sockets.on('connect', async (socket) => {
     socket.on('relaySDP', async (config) => {
         if (!Validate.isValidData(config)) return;
         const { peer_id, session_description } = config;
+
+        if (!hasPeerAccess(peer_id)) return;
 
         log.debug('[' + socket.id + '] relay SessionDescription to [' + peer_id + '] ', {
             type: session_description.type,
@@ -1540,13 +1586,15 @@ io.sockets.on('connect', async (socket) => {
         //log.debug('[' + socket.id + '] Room action:', config);
         const { room_id, peer_id, peer_name, peer_uuid, password, action } = config;
 
+        if (!hasRoomAccess(room_id, peer_name)) return;
+
         if (!peers[room_id]) {
             log.warn('Room action room not found', { peer_id: socket.id, room_id });
             return;
         }
 
         // Check if peer is presenter
-        const isPresenter = isPeerPresenter(room_id, peer_id, peer_name, peer_uuid);
+        const isPresenter = hasPresenterAccess(room_id, peer_id, peer_name, peer_uuid);
 
         let room_is_locked = false;
         //
@@ -1600,6 +1648,16 @@ io.sockets.on('connect', async (socket) => {
         // log.debug('Peer name', config);
         const { room_id, peer_name_old, peer_name_new, peer_avatar } = config;
 
+        if (!hasRoomAccess(room_id, peer_name_old)) return;
+
+        if (appointmentJoinCfg.required) {
+            const join = socket.appointmentJoin;
+            if (!join || join.room !== room_id || join.displayName !== peer_name_new) {
+                log.warn('[' + socket.id + '] appointment participant name change rejected');
+                return;
+            }
+        }
+
         let peer_id_to_update = null;
 
         for (let peer_id in peers[room_id]) {
@@ -1639,6 +1697,8 @@ io.sockets.on('connect', async (socket) => {
 
         if (!Validate.isValidData(data)) return;
 
+        if (!hasRoomAccess(data.room_id, data.peer_name)) return;
+
         await sendToRoom(data.room_id, socket.id, 'message', data);
     });
 
@@ -1658,13 +1718,16 @@ io.sockets.on('connect', async (socket) => {
 
         const { room_id, peer_id, peer_name, peer_uuid, to_peer_id } = data;
 
+        if (!hasRoomAccess(room_id, peer_name)) return;
+        if (!send_to_all && !hasPeerAccess(to_peer_id, room_id)) return;
+
         log.debug('cmd', config);
 
         // Only the presenter can do this actions
         const presenterActions = ['geoLocation'];
         if (presenterActions.some((v) => action === v)) {
             // Check if peer is presenter
-            const isPresenter = isPeerPresenter(room_id, peer_id, peer_name, peer_uuid);
+            const isPresenter = hasPresenterAccess(room_id, peer_id, peer_name, peer_uuid);
             // if not presenter do nothing
             if (!isPresenter) return;
         }
@@ -1691,6 +1754,8 @@ io.sockets.on('connect', async (socket) => {
 
         // log.debug('Peer status', config);
         const { room_id, peer_name, peer_id, element, status, extras } = config;
+
+        if (!hasRoomAccess(room_id, peer_name)) return;
 
         const data = {
             peer_id: peer_id,
@@ -1759,11 +1824,14 @@ io.sockets.on('connect', async (socket) => {
             send_to_all,
         } = config;
 
+        if (!hasRoomAccess(room_id, peer_name)) return;
+        if (!send_to_all && !hasPeerAccess(peer_id, room_id)) return;
+
         // Only the presenter can do this actions
         const presenterActions = ['muteAudio', 'hideVideo', 'ejectAll'];
         if (presenterActions.some((v) => peer_action === v)) {
             // Check if peer is presenter
-            const isPresenter = isPeerPresenter(room_id, peer_id, peer_name, peer_uuid);
+            const isPresenter = hasPresenterAccess(room_id, peer_id, peer_name, peer_uuid);
             // if not presenter do nothing
             if (!isPresenter) return;
         }
@@ -1797,6 +1865,8 @@ io.sockets.on('connect', async (socket) => {
 
         if (!Validate.isValidData(config)) return;
 
+        if (!hasRoomAccess(config.room_id, config.peer_name)) return;
+
         await sendToRoom(cfg.room_id, sockets, 'caption', config);
     });
 
@@ -1811,8 +1881,10 @@ io.sockets.on('connect', async (socket) => {
 
         const { room_id, peer_id, peer_uuid, peer_name } = config;
 
+        if (!hasRoomAccess(room_id, peer_name) || !hasPeerAccess(peer_id, room_id)) return;
+
         // Check if peer is presenter
-        const isPresenter = await isPeerPresenter(room_id, peer_id, peer_name, peer_uuid);
+        const isPresenter = hasPresenterAccess(room_id, peer_id, peer_name, peer_uuid);
 
         // Only the presenter can kickOut others
         if (isPresenter) {
@@ -1835,6 +1907,9 @@ io.sockets.on('connect', async (socket) => {
 
         // log.debug('File info', config);
         const { room_id, peer_id, peer_name, peer_avatar, broadcast, file } = config;
+
+        if (!hasRoomAccess(room_id, peer_name)) return;
+        if (!broadcast && !hasPeerAccess(peer_id, room_id)) return;
 
         // check if valid fileName
         if (!isValidFileName(file.fileName)) {
@@ -1876,6 +1951,8 @@ io.sockets.on('connect', async (socket) => {
 
         const { room_id, peer_name } = config;
 
+        if (!hasRoomAccess(room_id, peer_name)) return;
+
         log.debug('[' + socket.id + '] Peer [' + peer_name + '] send fileAbort to room_id [' + room_id + ']');
         await sendToRoom(room_id, socket.id, 'fileAbort');
     });
@@ -1886,6 +1963,7 @@ io.sockets.on('connect', async (socket) => {
         if (!Validate.isValidData(config)) return;
 
         const { room_id, peer_name } = config;
+        if (!hasRoomAccess(room_id, peer_name)) return;
         log.debug('[' + socket.id + '] Peer [' + peer_name + '] send fileReceiveAbort to room_id [' + room_id + ']');
         await sendToRoom(room_id, socket.id, 'fileReceiveAbort', config);
     });
@@ -1901,6 +1979,9 @@ io.sockets.on('connect', async (socket) => {
 
         // log.debug('Video player', config);
         const { room_id, peer_id, peer_name, video_action, video_src } = config;
+
+        if (!hasRoomAccess(room_id, peer_name)) return;
+        if (peer_id && !hasPeerAccess(peer_id, room_id)) return;
 
         // Check if valid video src url
         if (video_action == 'open' && !isValidHttpURL(video_src)) {
@@ -1937,6 +2018,7 @@ io.sockets.on('connect', async (socket) => {
 
         // log.debug('Whiteboard send canvas', config);
         const { room_id } = config;
+        if (!hasRoomAccess(room_id, config.peer_name)) return;
         await sendToRoom(room_id, socket.id, 'wbCanvasToJson', config);
     });
 
@@ -1948,6 +2030,7 @@ io.sockets.on('connect', async (socket) => {
 
         log.debug('Whiteboard', config);
         const { room_id } = config;
+        if (!hasRoomAccess(room_id, config.peer_name)) return;
         await sendToRoom(room_id, socket.id, 'whiteboardAction', config);
     });
 
@@ -1957,19 +2040,20 @@ io.sockets.on('connect', async (socket) => {
      */
     async function addPeerTo(channel) {
         for (let id in channels[channel]) {
+            const peerIceServers = getIceServers(socket.id);
             // offer false
             await channels[channel][id].emit('addPeer', {
                 peer_id: socket.id,
                 peers: peers[channel],
                 should_create_offer: false,
-                iceServers: iceServers,
+                iceServers: peerIceServers,
             });
             // offer true
             socket.emit('addPeer', {
                 peer_id: id,
                 peers: peers[channel],
                 should_create_offer: true,
-                iceServers: iceServers,
+                iceServers: peerIceServers,
             });
             log.debug('[' + socket.id + '] emit addPeer [' + id + ']');
         }
@@ -2006,6 +2090,7 @@ io.sockets.on('connect', async (socket) => {
             if (getPeerCount(channel) === 0) {
                 delete peers[channel];
                 delete presenters[channel];
+                delete roomAppointments[channel];
                 delete channels[channel]; // Clean up channels to prevent memory leak
             }
         } catch (err) {

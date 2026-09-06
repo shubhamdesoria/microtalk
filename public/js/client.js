@@ -23,6 +23,17 @@
 
 // https://www.w3schools.com/js/js_strict.asp
 
+const directJoinParams = (() => {
+    const params = new URLSearchParams(window.location.search);
+    const fragment = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+    fragment.forEach((value, key) => params.set(key, value));
+
+    if (fragment.has('token')) {
+        window.history.replaceState(null, '', window.location.pathname);
+    }
+    return params;
+})();
+
 // This room
 const myRoomId = getId('myRoomId');
 const roomSessionDuration = getRoomDuration();
@@ -1151,13 +1162,14 @@ function getChat() {
  * @returns {mixed} boolean false or token string
  */
 function getPeerToken() {
-    if (window.sessionStorage.peer_token) return window.sessionStorage.peer_token;
     let token = getQueryParam('token');
     let queryToken = false;
     if (token) {
         queryToken = token;
+    } else if (window.sessionStorage.peer_token) {
+        queryToken = window.sessionStorage.peer_token;
     }
-    console.log('Direct join', { token: queryToken });
+    console.log('Direct join', { token: queryToken ? '[present]' : false });
     return queryToken;
 }
 
@@ -1248,8 +1260,7 @@ function getHideMeActive() {
  * @returns {string} parameter value
  */
 function getQueryParam(param) {
-    const urlParams = new URLSearchParams(window.location.search);
-    return filterXSS(urlParams.get(param));
+    return filterXSS(directJoinParams.get(param));
 }
 
 /**

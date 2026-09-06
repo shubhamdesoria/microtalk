@@ -16,6 +16,11 @@ bun.lock
 
 # personal env
 .env
+.env.*
+!.env.template
+gha-creds-*.json
+*.pem
+*.key
 config.js
 docker-push.sh
 docker-compose.yml

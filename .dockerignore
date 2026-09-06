@@ -12,5 +12,10 @@ npm-debug.log
 # cache
 .cache
 
-# personal env
-.env
+# Environment files and generated local configuration must never enter an image.
+.env*
+app/src/config.js
+
+# TLS terminates at the Kubernetes ingress in production. Direct-TLS users can
+# mount certificates at TLS_KEY_PATH and TLS_CERT_PATH instead.
+app/ssl/*.pem

@@ -41,7 +41,38 @@ function parseJsonEnv(envValue, fallback) {
     }
 }
 
+function parseStringArrayEnv(envValue, legacyValue) {
+    if (!envValue) return legacyValue ? [legacyValue] : [];
+
+    try {
+        const parsed = JSON.parse(envValue);
+        if (Array.isArray(parsed)) {
+            return parsed
+                .filter((value) => typeof value === 'string')
+                .map((value) => value.trim())
+                .filter(Boolean);
+        }
+    } catch (error) {
+        return envValue
+            .split(',')
+            .map((value) => value.trim())
+            .filter(Boolean);
+    }
+
+    return [];
+}
+
+const environment = process.env.NODE_ENV || 'development';
+
+function getRequiredProductionValue(name, developmentDefault) {
+    const value = process.env[name]?.trim();
+    if (value) return value;
+    if (environment === 'production') throw new Error(`${name} must be set in production`);
+    return developmentDefault;
+}
+
 const port = process.env.PORT || 3000;
+const host = getRequiredProductionValue('HOST', `http://localhost:${port}`);
 
 module.exports = {
     // ==========================================
@@ -49,16 +80,19 @@ module.exports = {
     // ==========================================
     server: {
         port: port,
-        host: process.env.HOST || `http://localhost:${port}`,
-        environment: process.env.NODE_ENV || 'development',
+        host: host,
+        environment: environment,
         trustProxy: !!getEnvBoolean(process.env.TRUST_PROXY),
+        https: getEnvBoolean(process.env.HTTPS),
+        tlsKeyPath: process.env.TLS_KEY_PATH,
+        tlsCertPath: process.env.TLS_CERT_PATH,
     },
 
     // ==========================================
     // CORS
     // ==========================================
     cors: {
-        origin: parseJsonEnv(process.env.CORS_ORIGIN, '*'),
+        origin: parseJsonEnv(process.env.CORS_ORIGIN, environment === 'production' ? [host] : '*'),
         methods: parseJsonEnv(process.env.CORS_METHODS, ['GET', 'POST']),
     },
 
@@ -79,8 +113,14 @@ module.exports = {
     // JWT
     // ==========================================
     jwt: {
-        key: process.env.JWT_KEY || 'mirotalk_jwt_secret',
+        key: getRequiredProductionValue('JWT_KEY', 'mirotalk_jwt_secret'),
         exp: process.env.JWT_EXP || '1h',
+    },
+
+    appointmentJoin: {
+        required: environment === 'production' || getEnvBoolean(process.env.APPOINTMENT_JOIN_TOKENS_REQUIRED),
+        issuer: process.env.APPOINTMENT_JOIN_TOKEN_ISSUER || 'nitya-aarogya-backend',
+        audience: process.env.APPOINTMENT_JOIN_TOKEN_AUDIENCE || 'nitya-aarogya-mirotalk',
     },
 
     // ==========================================
@@ -92,8 +132,8 @@ module.exports = {
     // API
     // ==========================================
     api: {
-        keySecret: process.env.API_KEY_SECRET || 'mirotalkp2p_default_secret',
-        disabled: parseJsonEnv(process.env.API_DISABLED, ['token', 'meetings']),
+        keySecret: getRequiredProductionValue('API_KEY_SECRET', 'mirotalkp2p_default_secret'),
+        disabled: parseJsonEnv(process.env.API_DISABLED, ['token', 'meetings', 'meeting', 'join']),
     },
 
     // ==========================================
@@ -111,12 +151,17 @@ module.exports = {
         stun: {
             enabled: getEnvBoolean(process.env.STUN_SERVER_ENABLED),
             url: process.env.STUN_SERVER_URL,
+            urls: parseStringArrayEnv(process.env.STUN_SERVER_URLS, process.env.STUN_SERVER_URL),
         },
         turn: {
             enabled: getEnvBoolean(process.env.TURN_SERVER_ENABLED),
             url: process.env.TURN_SERVER_URL,
+            urls: parseStringArrayEnv(process.env.TURN_SERVER_URLS, process.env.TURN_SERVER_URL),
             username: process.env.TURN_SERVER_USERNAME,
             credential: process.env.TURN_SERVER_CREDENTIAL,
+            sharedSecret: process.env.TURN_SHARED_SECRET,
+            credentialTtlSeconds: process.env.TURN_CREDENTIAL_TTL_SECONDS || 3600,
+            credentialIdentity: process.env.TURN_CREDENTIAL_IDENTITY || 'mirotalk',
         },
     },
 
@@ -228,7 +273,7 @@ module.exports = {
     // Stats / Analytics
     // ==========================================
     stats: {
-        enabled: process.env.STATS_ENABLED ? getEnvBoolean(process.env.STATS_ENABLED) : true,
+        enabled: process.env.STATS_ENABLED ? getEnvBoolean(process.env.STATS_ENABLED) : false,
         src: process.env.STATS_SCR || 'https://stats.mirotalk.com/script.js',
         id: process.env.STATS_ID || 'c7615aa7-ceec-464a-baba-54cb605d7261',
     },

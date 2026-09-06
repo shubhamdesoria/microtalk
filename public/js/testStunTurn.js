@@ -19,13 +19,6 @@ if (iceServers) {
         {
             urls: 'stun:stun.l.google.com:19302',
         },
-        // Test some TURN server
-        // https://www.metered.ca/tools/openrelay/
-        {
-            urls: 'turn:a.relay.metered.ca:443',
-            username: 'e8dd65b92c62d3e36cafb807',
-            credential: 'uWdWNmkhvyqTEswO',
-        },
     ];
 }
 
