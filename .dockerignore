@@ -14,6 +14,7 @@ npm-debug.log
 
 # Environment files and generated local configuration must never enter an image.
 .env*
+gha-creds-*.json
 app/src/config.js
 
 # TLS terminates at the Kubernetes ingress in production. Direct-TLS users can

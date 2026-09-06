@@ -1,4 +1,4 @@
-FROM node:22.22-alpine3.24@sha256:e58326d0d441090181ac150dc2078d3e2cf6a0d42e809aebba3ef5880935ffdd AS dependencies
+FROM node:22.23.2-alpine3.24@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 AS dependencies
 
 WORKDIR /src
 
@@ -7,7 +7,12 @@ RUN npm ci --omit=dev --silent \
     && npm cache clean --force \
     && rm -rf /tmp/* /var/tmp/*
 
-FROM node:22.22-alpine3.24@sha256:e58326d0d441090181ac150dc2078d3e2cf6a0d42e809aebba3ef5880935ffdd AS runtime
+FROM node:22.23.2-alpine3.24@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 AS runtime
+
+# Patch OS libraries and omit the build-only package manager from the runtime.
+RUN apk upgrade --no-cache libcrypto3 libssl3 \
+    && rm -rf /usr/local/lib/node_modules/npm \
+    && rm -f /usr/local/bin/npm /usr/local/bin/npx
 
 ENV NODE_ENV=production \
     PORT=3000
